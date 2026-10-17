@@ -99,6 +99,9 @@ public:
 #if AP_RCPROTOCOL_EMLID_RCIO_ENABLED
         EMLID_RCIO = 21,
 #endif
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+        EXBUS = 22,
+#endif
         NONE    //last enum always is None
     };
 
@@ -212,6 +215,9 @@ public:
 #if AP_RCPROTOCOL_EMLID_RCIO_ENABLED
         case EMLID_RCIO:
 #endif
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+        case EXBUS:
+#endif
         case NONE:
             return false;
         }
@@ -240,8 +246,8 @@ public:
         return _detected_protocol;
     }
 
-    // add a UART for RCIN
-    void add_uart(AP_HAL::UARTDriver* uart);
+    // add a UART for RCIN (serial_idx is SERIALn index from SerialManager)
+    void add_uart(AP_HAL::UARTDriver* uart, uint8_t serial_idx = 255);
     bool has_uart() const { return added.uart != nullptr; }
 
     // set allowed RC protocols
@@ -257,6 +263,7 @@ public:
         uint8_t parity;
         uint8_t stop_bits;
         bool invert_rx;
+        bool half_duplex; // one-wire on TX pin (JETI EX Bus / similar)
     };
 
     // return true if we are decoding a byte stream, instead of pulses
@@ -307,6 +314,7 @@ private:
         bool opened;
         uint32_t last_config_change_ms;
         uint8_t config_num;
+        uint8_t serial_idx; // SERIALn index from SerialManager (255 if unknown)
 #if AP_RCPROTOCOL_CRSF_ENABLED && (defined(STM32F4) || defined(STM32F7))
         uint32_t crsf_dma_warning_ms;
 #endif

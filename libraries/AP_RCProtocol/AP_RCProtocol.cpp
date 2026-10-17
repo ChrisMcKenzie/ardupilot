@@ -41,6 +41,7 @@
 #include "AP_RCProtocol_UDP.h"
 #include "AP_RCProtocol_FDM.h"
 #include "AP_RCProtocol_Radio.h"
+#include "AP_RCProtocol_EXBUS.h"
 #include <AP_Math/AP_Math.h>
 #include <RC_Channel/RC_Channel.h>
 
@@ -123,6 +124,9 @@ void AP_RCProtocol::init()
 #endif  // AP_RCPROTOCOL_IOMCU_ENABLED
 #if AP_RCPROTOCOL_EMLID_RCIO_ENABLED
     backend[AP_RCProtocol::EMLID_RCIO] = NEW_NOTHROW AP_RCProtocol_Emlid_RCIO(*this);
+#endif
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+    backend[AP_RCProtocol::EXBUS] = NEW_NOTHROW AP_RCProtocol_EXBUS(*this);
 #endif
 }
 
@@ -327,30 +331,47 @@ void AP_RCProtocol::SerialConfig::apply_to_uart(AP_HAL::UARTDriver *uart) const
 {
     uart->configure_parity(parity);
     uart->set_stop_bits(stop_bits);
+    uint16_t options = uart->get_options();
     if (invert_rx) {
-        uart->set_options(uart->get_options() | AP_HAL::UARTDriver::OPTION_RXINV);
+        options |= AP_HAL::UARTDriver::OPTION_RXINV;
     } else {
-        uart->set_options(uart->get_options() & ~AP_HAL::UARTDriver::OPTION_RXINV);
+        options &= ~AP_HAL::UARTDriver::OPTION_RXINV;
     }
+    // EX Bus is a single-wire bus; Betaflight-style wiring uses the UART TX pin
+    // in half-duplex. Full-duplex configs keep the RX pin for RX-only wiring.
+    if (half_duplex) {
+        options |= AP_HAL::UARTDriver::OPTION_HDPLEX;
+    } else {
+        options &= ~AP_HAL::UARTDriver::OPTION_HDPLEX;
+    }
+    uart->set_options(options);
     uart->begin(baud, 128, 128);
 }
 
 static const AP_RCProtocol::SerialConfig serial_configs[] {
-    // BAUD PRTY STOP INVERT-RX
+    // BAUD PRTY STOP INVERT-RX HALF-DUPLEX
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+    // JETI EX Bus first so auto-detect finds 125k quickly (R3 default is LowSpeed).
+    // Try TX half-duplex (common single-wire hookup) and RX full-duplex.
+    { 125000,  0,   1, false, true  },
+    { 125000,  0,   1, false, false },
+    { 250000,  0,   1, false, true  },
+    { 250000,  0,   1, false, false },
+#endif
     // inverted and uninverted 115200 8N1:
-    { 115200,  0,   1, false  },
-    { 115200,  0,   1, true },
+    { 115200,  0,   1, false, false },
+    { 115200,  0,   1, true,  false },
     // SBUS settings, even parity, 2 stop bits:
-    { 100000,  2,   2, true },
+    { 100000,  2,   2, true,  false },
 #if AP_RCPROTOCOL_FASTSBUS_ENABLED
     // FastSBUS:
-    { 200000,  2,   2, true },
+    { 200000,  2,   2, true,  false },
 #endif
 #if AP_RCPROTOCOL_CRSF_ENABLED || AP_RCPROTOCOL_GHST_ENABLED
     // CrossFire:
-    { 416666,  0,   1, false },
+    { 416666,  0,   1, false, false },
     // CRSFv3 can negotiate higher rates which are sticky on soft reboot
-    { 2000000, 0,   1, false },
+    { 2000000, 0,   1, false, false },
 #endif
 };
 
@@ -367,14 +388,59 @@ void AP_RCProtocol::check_added_uart(void)
         // not using this uart
         return;
     }
+#if AP_RC_CHANNEL_ENABLED
+    rc_protocols_mask = rc().enabled_protocols();
+#endif
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+    // When RC_PROTOCOLS enables only EXBUS, skip unrelated UART baud configs
+    // so 125k/250k half-duplex is probed continuously.
+    bool exbus_only = false;
+    if (protocol_enabled(EXBUS) && (rc_protocols_mask & 1U) == 0) {
+        exbus_only = true;
+        for (uint8_t i = 0; i < uint8_t(NONE); i++) {
+            if (i == uint8_t(EXBUS)) {
+                continue;
+            }
+            if (backend[i] != nullptr && protocol_enabled(rcprotocol_t(i))) {
+                exbus_only = false;
+                break;
+            }
+        }
+    }
+    const uint32_t cfg_baud = serial_configs[added.config_num].baud;
+    const bool cfg_is_exbus = (cfg_baud == 125000U || cfg_baud == 250000U);
+    if (exbus_only && !cfg_is_exbus) {
+        for (uint8_t i = 0; i < ARRAY_SIZE(serial_configs); i++) {
+            const uint32_t b = serial_configs[i].baud;
+            if (b == 125000U || b == 250000U) {
+                added.config_num = i;
+                added.opened = false;
+                break;
+            }
+        }
+    }
+#endif  // AP_RCPROTOCOL_EXBUS_ENABLED
     if (!added.opened) {
         added.opened = true;
         added.last_config_change_ms = AP_HAL::millis();
         serial_configs[added.config_num].apply_to_uart(added.uart);
-    }
-#if AP_RC_CHANNEL_ENABLED
-    rc_protocols_mask = rc().enabled_protocols();
+#if AP_RCPROTOCOL_EXBUS_ENABLED && AP_RCPROTOCOL_EXBUS_DEBUG
+        // Optional bring-up spam (compile with AP_RCPROTOCOL_EXBUS_DEBUG=1)
+        if (protocol_enabled(EXBUS) && !hal.util->get_soft_armed()) {
+            const auto &cfg = serial_configs[added.config_num];
+            if (cfg.baud == 125000U || cfg.baud == 250000U) {
+                static uint32_t last_cfg_msg_ms;
+                if (now - last_cfg_msg_ms > 2000) {
+                    last_cfg_msg_ms = now;
+                    GCS_SEND_TEXT(MAV_SEVERITY_DEBUG, "EXBUS probe: baud=%lu hdplex=%u SERIAL%u",
+                                  (unsigned long)cfg.baud,
+                                  unsigned(cfg.half_duplex),
+                                  unsigned(added.serial_idx));
+                }
+            }
+        }
 #endif
+    }
 #if AP_RCPROTOCOL_CRSF_ENABLED && (defined(STM32F4) || defined(STM32F7))
     // warn every 10s while disarmed if CRSF has been detected
     if (added.uart->is_initialized() &&
@@ -400,10 +466,23 @@ void AP_RCProtocol::check_added_uart(void)
     if (searching) {
         if (now - added.last_config_change_ms > 1000) {
             // change configs if not detected once a second
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+            const uint8_t start = added.config_num;
+            do {
+                added.config_num++;
+                if (added.config_num >= ARRAY_SIZE(serial_configs)) {
+                    added.config_num = 0;
+                }
+            } while (exbus_only &&
+                     !(serial_configs[added.config_num].baud == 125000U ||
+                       serial_configs[added.config_num].baud == 250000U) &&
+                     added.config_num != start);
+#else
             added.config_num++;
             if (added.config_num >= ARRAY_SIZE(serial_configs)) {
                 added.config_num = 0;
             }
+#endif
             added.opened = false;
         }
     // power loss on CRSF requires re-bootstrap because the baudrate is reset to the default. The CRSF side will
@@ -714,6 +793,10 @@ const char *AP_RCProtocol::protocol_name_from_protocol(rcprotocol_t protocol)
     case EMLID_RCIO:
         return "Emlid RCIO";
 #endif
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+    case EXBUS:
+        return "EXBUS";
+#endif
     case NONE:
         break;
     }
@@ -724,9 +807,10 @@ const char *AP_RCProtocol::protocol_name_from_protocol(rcprotocol_t protocol)
 /*
   add a uart to decode
  */
-void AP_RCProtocol::add_uart(AP_HAL::UARTDriver* uart)
+void AP_RCProtocol::add_uart(AP_HAL::UARTDriver* uart, uint8_t serial_idx)
 {
     added.uart = uart;
+    added.serial_idx = serial_idx;
     added.uart->set_flow_control(AP_HAL::UARTDriver::FLOW_CONTROL_DISABLE);
 }
 
