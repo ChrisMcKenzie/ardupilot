@@ -41,6 +41,7 @@
 #include "AP_RCProtocol_UDP.h"
 #include "AP_RCProtocol_FDM.h"
 #include "AP_RCProtocol_Radio.h"
+#include "AP_RCProtocol_EXBUS.h"
 #include <AP_Math/AP_Math.h>
 #include <RC_Channel/RC_Channel.h>
 
@@ -123,6 +124,9 @@ void AP_RCProtocol::init()
 #endif  // AP_RCPROTOCOL_IOMCU_ENABLED
 #if AP_RCPROTOCOL_EMLID_RCIO_ENABLED
     backend[AP_RCProtocol::EMLID_RCIO] = NEW_NOTHROW AP_RCProtocol_Emlid_RCIO(*this);
+#endif
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+    backend[AP_RCProtocol::EXBUS] = NEW_NOTHROW AP_RCProtocol_EXBUS(*this);
 #endif
 }
 
@@ -351,6 +355,11 @@ static const AP_RCProtocol::SerialConfig serial_configs[] {
     { 416666,  0,   1, false },
     // CRSFv3 can negotiate higher rates which are sticky on soft reboot
     { 2000000, 0,   1, false },
+#endif
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+    // JETI EX Bus LowSpeed / HighSpeed:
+    { 125000,  0,   1, false },
+    { 250000,  0,   1, false },
 #endif
 };
 
@@ -713,6 +722,10 @@ const char *AP_RCProtocol::protocol_name_from_protocol(rcprotocol_t protocol)
 #if AP_RCPROTOCOL_EMLID_RCIO_ENABLED
     case EMLID_RCIO:
         return "Emlid RCIO";
+#endif
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+    case EXBUS:
+        return "EXBUS";
 #endif
     case NONE:
         break;
