@@ -4,6 +4,7 @@
  */
 #include <AP_gtest.h>
 #include <AP_HAL/AP_HAL.h>
+#include <AP_Math/crc.h>
 #include <AP_RCProtocol/AP_RCProtocol.h>
 #include <AP_RCProtocol/AP_RCProtocol_EXBUS.h>
 #include <AP_SerialManager/AP_SerialManager.h>
@@ -130,6 +131,37 @@ TEST(EXBUSDecode, test_exbus_uart_batch_gap_completes)
     EXPECT_EQ(exbus.num_channels(), 16);
     EXPECT_EQ(exbus.read(0), 1008);
 }
+
+TEST(EXBUSDecode, test_exbus_extel_crc8_pdf_text)
+{
+    // PDF EX-Text body from type_len through last data; CRC = 0x28
+    const uint8_t body[] = {
+        0x0F, 0xA1, 0xA8, 0x5D, 0x55, 0x00, 0x02, 0x2A,
+        0x54, 0x65, 0x6D, 0x70, 0x2E, 0xB0, 0x43
+    };
+    EXPECT_EQ(AP_RCProtocol_EXBUS::ex_crc8(body, sizeof(body)), 0x28);
+}
+
+#if AP_EXBUS_TELEM_ENABLED
+TEST(EXBUSDecode, test_exbus_telem_reply_device_name)
+{
+    uint8_t out[64] {};
+    uint8_t next = 0;
+    const uint8_t len = AP_RCProtocol_EXBUS::build_telem_reply(0x06, 0, out, sizeof(out), next);
+    EXPECT_GT(len, 8);
+    EXPECT_EQ(out[0], 0x3B);
+    EXPECT_EQ(out[1], 0x01);
+    EXPECT_EQ(out[2], len);
+    EXPECT_EQ(out[3], 0x06);
+    EXPECT_EQ(out[4], 0x3A);
+    EXPECT_EQ(out[6], 0x9F); // EXTEL sync
+    // EX Bus CRC over frame without CRC bytes must match trailer
+    const uint16_t crc = crc16_ccitt_r(out, len - 2, 0, 0);
+    const uint16_t rx = uint16_t(out[len - 2]) | (uint16_t(out[len - 1]) << 8);
+    EXPECT_EQ(crc, rx);
+    EXPECT_EQ(next, 1);
+}
+#endif
 
 #endif  // AP_RCPROTOCOL_EXBUS_ENABLED
 

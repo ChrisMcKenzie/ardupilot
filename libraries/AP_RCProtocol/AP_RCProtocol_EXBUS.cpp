@@ -12,8 +12,9 @@
  * You should have received a copy of the GNU General Public License along
  * with this program.  If not, see <http://www.gnu.org/licenses/>.
  *
- * JETI EX Bus RC protocol decoder (channel frames only).
+ * JETI EX Bus RC protocol decoder (+ optional Slave EX telemetry).
  * Spec: EX Bus communication protocol v1.21
+ *       JETI Telemetry communication protocol v1.07 (EX payload)
  */
 
 #include "AP_RCProtocol_config.h"
@@ -22,11 +23,36 @@
 
 #include "AP_RCProtocol_EXBUS.h"
 #include <AP_Math/crc.h>
+#include <AP_Math/AP_Math.h>
+#include <string.h>
+#if AP_EXBUS_TELEM_ENABLED
+#include <AP_AHRS/AP_AHRS.h>
+#include <AP_BattMonitor/AP_BattMonitor.h>
+#endif
 #if AP_RCPROTOCOL_EXBUS_DEBUG
 #include <GCS_MAVLink/GCS.h>
 #endif
 
 extern const AP_HAL::HAL& hal;
+
+/*
+  EXTEL CRC8 — PDF poly X^8+X^2+X+1 (same result as Betaflight jetiexbus).
+ */
+uint8_t AP_RCProtocol_EXBUS::ex_crc8(const uint8_t *data, uint8_t len)
+{
+    uint8_t crc = 0;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t b = 0; b < 8; b++) {
+            if (crc & 0x80) {
+                crc = uint8_t((crc << 1) ^ 0x07);
+            } else {
+                crc = uint8_t(crc << 1);
+            }
+        }
+    }
+    return crc;
+}
 
 /*
   decode a full EX Bus channel frame.
@@ -121,7 +147,6 @@ void AP_RCProtocol_EXBUS::_process_byte(uint32_t timestamp_us, uint8_t b)
 #if AP_RCPROTOCOL_EXBUS_DEBUG
             _drop++;
 #endif
-            // try this byte as a new header
             if (b == EXBUS_HEAD_CHANNEL || b == EXBUS_HEAD_REQUEST) {
 #if AP_RCPROTOCOL_EXBUS_DEBUG
                 _headers++;
@@ -160,29 +185,35 @@ void AP_RCProtocol_EXBUS::_process_byte(uint32_t timestamp_us, uint8_t b)
         return;
     }
 
-    // full frame collected (channel or request); only channel frames produce RC input
     log_data(AP_RCProtocol::EXBUS, timestamp_us, byte_input.buf, frame_len);
 
-    uint16_t values[MAX_RCIN_CHANNELS];
-    uint8_t nchan = 0;
+    const uint16_t crc_calc = crc16_ccitt_r(byte_input.buf, frame_len - EXBUS_CRC_LEN, 0, 0);
+    const uint16_t crc_rx = uint16_t(byte_input.buf[frame_len - 2]) | (uint16_t(byte_input.buf[frame_len - 1]) << 8);
+    const bool crc_ok = (crc_calc == crc_rx);
+
     if (byte_input.buf[0] == EXBUS_HEAD_CHANNEL) {
-        const uint16_t crc_calc = crc16_ccitt_r(byte_input.buf, frame_len - EXBUS_CRC_LEN, 0, 0);
-        const uint16_t crc_rx = uint16_t(byte_input.buf[frame_len - 2]) | (uint16_t(byte_input.buf[frame_len - 1]) << 8);
-        if (crc_calc != crc_rx) {
+        if (!crc_ok) {
 #if AP_RCPROTOCOL_EXBUS_DEBUG
             _crc_fail++;
 #endif
-        } else if (decode_channel_frame(byte_input.buf, frame_len, values, nchan)) {
-#if AP_RCPROTOCOL_EXBUS_DEBUG
-            _frames_ok++;
-#endif
-            // EX Bus has no failsafe flag; Master stops sending on RF loss
-            add_input(nchan, values, false);
-#if AP_RCPROTOCOL_EXBUS_DEBUG
         } else {
-            _drop++;
+            uint16_t values[MAX_RCIN_CHANNELS];
+            uint8_t nchan = 0;
+            if (decode_channel_frame(byte_input.buf, frame_len, values, nchan)) {
+#if AP_RCPROTOCOL_EXBUS_DEBUG
+                _frames_ok++;
 #endif
+                add_input(nchan, values, false);
+#if AP_RCPROTOCOL_EXBUS_DEBUG
+            } else {
+                _drop++;
+#endif
+            }
         }
+#if AP_EXBUS_TELEM_ENABLED
+    } else if (byte_input.buf[0] == EXBUS_HEAD_REQUEST && crc_ok) {
+        handle_telem_request(byte_input.buf, frame_len, timestamp_us);
+#endif
     }
 
     byte_input.ofs = 0;
@@ -204,9 +235,194 @@ void AP_RCProtocol_EXBUS::process_byte_ts(uint8_t b, uint32_t baudrate, uint32_t
     _process_byte(timestamp_us, b);
 }
 
-#if AP_RCPROTOCOL_EXBUS_DEBUG
+#if AP_EXBUS_TELEM_ENABLED
+
+namespace {
+
+enum class ExType : uint8_t {
+    INT22 = 4,
+    DES = 255,
+};
+
+struct ExSensor {
+    const char *label;
+    const char *unit;
+    ExType type;
+    uint8_t decimals; // DECIMAL_MASK style: decimals in bits 5..6 of last value byte
+};
+
+// MVP sensor table (id 0 = device name). Keep small for flash + 4 ms window.
+const ExSensor k_sensors[] = {
+    { "ArduPilot", "",   ExType::DES,   0 },
+    { "Voltage",   "V",  ExType::INT22, 1 },
+    { "Current",   "A",  ExType::INT22, 2 },
+    { "Altitude",  "m",  ExType::INT22, 1 },
+    { "Roll",      "\xB0", ExType::INT22, 1 },
+    { "Pitch",     "\xB0", ExType::INT22, 1 },
+};
+
+constexpr uint8_t k_sensor_count = ARRAY_SIZE(k_sensors);
+constexpr uint8_t k_desc_rounds = k_sensor_count; // one text frame per sensor/device
+
+uint8_t decimal_mask(uint8_t decimals)
+{
+    return uint8_t(decimals << 5);
+}
+
+int32_t sensor_value(uint8_t id)
+{
+    switch (id) {
+    case 1: { // Voltage * 10
+        return int32_t(roundf(AP::battery().voltage() * 10.0f));
+    }
+    case 2: { // Current * 100
+        float amps = 0;
+        if (!AP::battery().current_amps(amps)) {
+            return 0;
+        }
+        return int32_t(roundf(amps * 100.0f));
+    }
+    case 3: { // Altitude m * 10
+        float alt = 0;
+        AP::ahrs().get_relative_position_D_home(alt);
+        return int32_t(roundf((-alt) * 10.0f));
+    }
+    case 4: // Roll deg * 10
+        return int32_t(roundf(degrees(AP::ahrs().get_roll()) * 10.0f));
+    case 5: // Pitch deg * 10
+        return int32_t(roundf(degrees(AP::ahrs().get_pitch()) * 10.0f));
+    default:
+        return 0;
+    }
+}
+
+} // namespace
+
+void AP_RCProtocol_EXBUS::handle_telem_request(const uint8_t *frame, uint8_t frame_len, uint32_t timestamp_us)
+{
+    if (frame_len < EXBUS_MIN_FRAME_LEN) {
+        return;
+    }
+    if (frame[1] != EXBUS_REQ_REPLY) {
+        return;
+    }
+    if (frame[4] != EXBUS_DATA_TELEM) {
+        return; // Jetibox 0x3B etc. ignored in MVP
+    }
+    telem.pending = true;
+    telem.packet_id = frame[3];
+    telem.request_us = timestamp_us;
+}
+
+uint8_t AP_RCProtocol_EXBUS::build_telem_reply(uint8_t packet_id, uint8_t sensor_step,
+        uint8_t *out, uint8_t out_max, uint8_t &next_sensor_step)
+{
+    if (out_max < 16) {
+        return 0;
+    }
+
+    // EX Bus header placeholders; LEN/SUB_LEN filled after EXTEL size known
+    out[0] = EXBUS_HEAD_REPLY;
+    out[1] = EXBUS_REQ_REPLY;
+    out[3] = packet_id;
+    out[4] = EXBUS_DATA_TELEM;
+
+    uint8_t ex_buf[40];
+    memset(ex_buf, 0, sizeof(ex_buf));
+    ex_buf[0] = 0x9F; // EXTEL sync (N=9)
+    ex_buf[2] = uint8_t(EXBUS_TELEM_MFG_ID & 0xFF);
+    ex_buf[3] = uint8_t((EXBUS_TELEM_MFG_ID >> 8) & 0xFF);
+    ex_buf[4] = uint8_t(EXBUS_TELEM_DEV_ID & 0xFF);
+    ex_buf[5] = uint8_t((EXBUS_TELEM_DEV_ID >> 8) & 0xFF);
+    ex_buf[6] = 0x00; // reserved
+
+    // sensor_step 0..k_desc_rounds-1 = text descriptors; then values for ids 1..N-1
+    uint8_t ex_len; // CRC coverage length starting at type_len (ex_buf[1])
+    if (sensor_step < k_desc_rounds) {
+        const uint8_t sid = sensor_step;
+        const ExSensor &s = k_sensors[sid];
+        const uint8_t lab_len = strnlen(s.label, 15);
+        const uint8_t unit_len = strnlen(s.unit, 7);
+        ex_len = uint8_t(1 + 4 + 1 + 1 + 1 + lab_len + unit_len);
+        ex_buf[1] = ex_len; // type=0 (text)
+        ex_buf[7] = sid;
+        ex_buf[8] = uint8_t((lab_len << 3) | (unit_len & 0x07));
+        memcpy(&ex_buf[9], s.label, lab_len);
+        memcpy(&ex_buf[9 + lab_len], s.unit, unit_len);
+        next_sensor_step = uint8_t(sensor_step + 1);
+    } else {
+        uint8_t sid = uint8_t(1 + ((sensor_step - k_desc_rounds) % (k_sensor_count - 1)));
+        const ExSensor &s = k_sensors[sid];
+        const int32_t val = sensor_value(sid);
+        ex_len = 1 + 4 + 1 + 1 + 3;
+        ex_buf[1] = uint8_t(0x40 | ex_len); // type=1 (data)
+        ex_buf[7] = uint8_t((sid << 4) | uint8_t(s.type));
+        ex_buf[8] = uint8_t(val & 0xFF);
+        ex_buf[9] = uint8_t((val >> 8) & 0xFF);
+        ex_buf[10] = uint8_t(((val >> 16) & 0x1F) | decimal_mask(s.decimals));
+        next_sensor_step = uint8_t(sensor_step + 1);
+    }
+
+    const uint8_t crc8 = ex_crc8(&ex_buf[1], ex_len);
+    ex_buf[1 + ex_len] = crc8;
+    const uint8_t ex_total = uint8_t(1 + ex_len + 1); // sync + body + crc8
+
+    const uint8_t sub_len = ex_total;
+    const uint8_t frame_len = uint8_t(EXBUS_OVERHEAD + sub_len);
+    if (frame_len > out_max) {
+        return 0;
+    }
+
+    out[2] = frame_len;
+    out[5] = sub_len;
+    memcpy(&out[6], ex_buf, ex_total);
+
+    const uint16_t crc16 = crc16_ccitt_r(out, frame_len - EXBUS_CRC_LEN, 0, 0);
+    out[frame_len - 2] = uint8_t(crc16 & 0xFF);
+    out[frame_len - 1] = uint8_t((crc16 >> 8) & 0xFF);
+    return frame_len;
+}
+
+void AP_RCProtocol_EXBUS::send_telem_reply(void)
+{
+    if (!telem.pending) {
+        return;
+    }
+    const uint32_t now = AP_HAL::micros();
+    if (now - telem.request_us > EXBUS_TELEM_REPLY_TIMEOUT_US) {
+        telem.pending = false;
+        return;
+    }
+    AP_HAL::UARTDriver *uart = get_available_UART();
+    if (uart == nullptr) {
+        telem.pending = false;
+        return;
+    }
+    if (uart->available() > 0) {
+        return; // half-duplex: wait for idle line within reply window
+    }
+
+    uint8_t frame[EXBUS_MAX_FRAME_LEN];
+    uint8_t next_step = 0;
+    const uint8_t len = build_telem_reply(telem.packet_id, telem.sensor_step, frame, sizeof(frame), next_step);
+    if (len == 0) {
+        telem.pending = false;
+        return;
+    }
+
+    uart->write(frame, len);
+    telem.pending = false;
+    telem.sensor_step = next_step;
+}
+
+#endif  // AP_EXBUS_TELEM_ENABLED
+
 void AP_RCProtocol_EXBUS::update(void)
 {
+#if AP_EXBUS_TELEM_ENABLED
+    send_telem_reply();
+#endif
+#if AP_RCPROTOCOL_EXBUS_DEBUG
 #if HAL_GCS_ENABLED
     if (hal.util->get_soft_armed()) {
         return;
@@ -227,7 +443,7 @@ void AP_RCProtocol_EXBUS::update(void)
                   (unsigned long)_crc_fail,
                   (unsigned long)_frame_timeout);
 #endif
+#endif
 }
-#endif  // AP_RCPROTOCOL_EXBUS_DEBUG
 
 #endif  // AP_RCPROTOCOL_EXBUS_ENABLED
