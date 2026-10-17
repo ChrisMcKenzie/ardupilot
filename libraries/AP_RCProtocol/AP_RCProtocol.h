@@ -246,8 +246,8 @@ public:
         return _detected_protocol;
     }
 
-    // add a UART for RCIN
-    void add_uart(AP_HAL::UARTDriver* uart);
+    // add a UART for RCIN (serial_idx is SERIALn index from SerialManager)
+    void add_uart(AP_HAL::UARTDriver* uart, uint8_t serial_idx = 255);
     bool has_uart() const { return added.uart != nullptr; }
 
     // set allowed RC protocols
@@ -314,6 +314,8 @@ private:
         bool opened;
         uint32_t last_config_change_ms;
         uint8_t config_num;
+        uint8_t serial_idx; // SERIALn index from SerialManager (255 if unknown)
+        bool rcin_announced; // one-shot EXBUS RCIN NOTICE
 #if AP_RCPROTOCOL_CRSF_ENABLED && (defined(STM32F4) || defined(STM32F7))
         uint32_t crsf_dma_warning_ms;
 #endif

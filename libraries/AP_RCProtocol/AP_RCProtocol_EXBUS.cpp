@@ -167,7 +167,8 @@ void AP_RCProtocol_EXBUS::update(void)
         return;
     }
     _last_debug_ms = now;
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+    // NOTICE so QGC shows this by default (INFO is often filtered)
+    GCS_SEND_TEXT(MAV_SEVERITY_NOTICE,
                   "EXBUS dbg: bytes=%lu hdr=%lu ok=%lu crcfail=%lu baud=%lu",
                   (unsigned long)_bytes_in,
                   (unsigned long)_headers,

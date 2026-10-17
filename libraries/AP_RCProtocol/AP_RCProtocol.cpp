@@ -425,6 +425,16 @@ void AP_RCProtocol::check_added_uart(void)
         added.last_config_change_ms = AP_HAL::millis();
         serial_configs[added.config_num].apply_to_uart(added.uart);
 #if AP_RCPROTOCOL_EXBUS_ENABLED
+        // One-shot: confirm which SERIALn RCIN UART is bound (QGC-visible NOTICE)
+        if (!added.rcin_announced && protocol_enabled(EXBUS)) {
+            added.rcin_announced = true;
+            if (added.serial_idx != 255) {
+                GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "EXBUS: RCIN on SERIAL%u",
+                              unsigned(added.serial_idx));
+            } else {
+                GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "EXBUS: RCIN UART registered");
+            }
+        }
         // Announce probe whenever EXBUS is enabled (not only EXBUS-only mask)
         // and the active UART config is an EX Bus baud.
         if (protocol_enabled(EXBUS) && !hal.util->get_soft_armed()) {
@@ -433,7 +443,7 @@ void AP_RCProtocol::check_added_uart(void)
                 static uint32_t last_cfg_msg_ms;
                 if (now - last_cfg_msg_ms > 2000) {
                     last_cfg_msg_ms = now;
-                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "EXBUS probe: baud=%lu hdplex=%u",
+                    GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "EXBUS probe: baud=%lu hdplex=%u",
                                   (unsigned long)cfg.baud,
                                   unsigned(cfg.half_duplex));
                 }
@@ -576,6 +586,13 @@ void AP_RCProtocol::announce_detected()
     }
     (void)src;  // iofirmware doesn't use this
     (void)name;  // iofirmware doesn't use this
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+    // NOTICE so QGC shows EXBUS lock by default (DEBUG/INFO often hidden)
+    if (_detected_protocol == EXBUS) {
+        GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "RCInput: decoding %s (%s)", name, src);
+        return;
+    }
+#endif
     GCS_SEND_TEXT(MAV_SEVERITY_DEBUG, "RCInput: decoding %s (%s)", name, src);
 }
 
@@ -807,9 +824,10 @@ const char *AP_RCProtocol::protocol_name_from_protocol(rcprotocol_t protocol)
 /*
   add a uart to decode
  */
-void AP_RCProtocol::add_uart(AP_HAL::UARTDriver* uart)
+void AP_RCProtocol::add_uart(AP_HAL::UARTDriver* uart, uint8_t serial_idx)
 {
     added.uart = uart;
+    added.serial_idx = serial_idx;
     added.uart->set_flow_control(AP_HAL::UARTDriver::FLOW_CONTROL_DISABLE);
 }
 
