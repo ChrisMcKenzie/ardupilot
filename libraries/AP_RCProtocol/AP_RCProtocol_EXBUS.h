@@ -46,8 +46,9 @@
 #define EXBUS_DATA_TELEM    0x3A
 
 // Third-party EX manufacturer ID range is 0xA400–0xA41F (JETI telem PDF).
+// LSN_LB = sensor_index & 0xF0 (device group); LSN_HB = 'A' branding (Betaflight-style).
 #define EXBUS_TELEM_MFG_ID  0xA400U
-#define EXBUS_TELEM_DEV_ID  0x4150U  // 'AP'
+#define EXBUS_TELEM_LSN_HB 0x41U    // 'A'
 
 // Master releases bus ≥4 ms; reply before ~3 ms (Betaflight uses 3000 µs).
 #define EXBUS_TELEM_REPLY_TIMEOUT_US 3000U

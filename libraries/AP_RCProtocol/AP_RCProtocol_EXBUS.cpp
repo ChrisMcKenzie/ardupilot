@@ -28,6 +28,7 @@
 #if AP_EXBUS_TELEM_ENABLED
 #include <AP_AHRS/AP_AHRS.h>
 #include <AP_BattMonitor/AP_BattMonitor.h>
+#include <AP_Notify/AP_Notify.h>
 #include <AP_GPS/AP_GPS_config.h>
 #if AP_GPS_ENABLED
 #include <AP_GPS/AP_GPS.h>
@@ -260,11 +261,12 @@ struct ExSensor {
 };
 
 /*
-  One EX device, ids 0..14 (JETI allows 15 value ids per device).
-  Id 0 = device name. Values cycle 1..N-1; several int22s packed per data frame.
+  JETI allows 15 value ids per EX device (id 0 = device name).
+  Global index high nibble → LSN_LB device group (Betaflight jetiexbus).
+  Index 16 = second device DES; values must not pack across groups.
  */
 const ExSensor k_sensors[] = {
-    { "ArduPilot",  "",    ExType::DES,   0 }, // 0 device
+    { "ArduPilot",  "",    ExType::DES,   0 }, // 0 device 0
     { "Voltage",    "V",   ExType::INT22, 1 }, // 1
     { "Current",    "A",   ExType::INT22, 2 }, // 2
     { "Capacity",   "mAh", ExType::INT22, 0 }, // 3
@@ -279,12 +281,36 @@ const ExSensor k_sensors[] = {
     { "GPS Speed",  "m/s", ExType::INT22, 1 }, // 12
     { "Home Dist",  "m",   ExType::INT22, 0 }, // 13
     { "Remaining",  "%",   ExType::INT22, 0 }, // 14
+    { "Failsafe",   "",    ExType::INT22, 0 }, // 15
+    { "AP Status",  "",    ExType::DES,   0 }, // 16 device 1
+    { "Armed",      "",    ExType::INT22, 0 }, // 17
+    { "Mode",       "",    ExType::INT22, 0 }, // 18
+    { "Safety",     "",    ExType::INT22, 0 }, // 19
+    { "Flying",     "",    ExType::INT22, 0 }, // 20
 };
 
 constexpr uint8_t k_sensor_count = ARRAY_SIZE(k_sensors);
 constexpr uint8_t k_desc_rounds = k_sensor_count;
+// Value-phase marker in sensor_step (descriptions use 0..k_desc_rounds-1)
+constexpr uint8_t k_value_phase = 0x80;
 // EXTEL data payload budget after sync+type_len+serial+res (Betaflight ~18 B)
 constexpr uint8_t k_extel_data_payload_max = 18;
+
+uint8_t next_value_sensor(uint8_t idx)
+{
+    do {
+        idx = uint8_t(idx + 1);
+        if (idx >= k_sensor_count) {
+            idx = 0;
+        }
+    } while (k_sensors[idx].type == ExType::DES);
+    return idx;
+}
+
+uint8_t first_value_sensor(void)
+{
+    return next_value_sensor(k_sensor_count - 1);
+}
 
 uint8_t decimal_mask(uint8_t decimals)
 {
@@ -432,6 +458,16 @@ int32_t sensor_value(uint8_t id)
         }
         return int32_t(pct);
     }
+    case 15: // Radio failsafe 0/1
+        return AP_Notify::flags.failsafe_radio ? 1 : 0;
+    case 17: // Armed 0/1
+        return hal.util->get_soft_armed() ? 1 : 0;
+    case 18: // Flight mode number
+        return int32_t(AP_Notify::flags.flight_mode);
+    case 19: // Safety: 1 = motors allowed (not SAFETY_DISARMED)
+        return (hal.util->safety_switch_state() != AP_HAL::Util::SAFETY_DISARMED) ? 1 : 0;
+    case 20: // Flying 0/1
+        return AP_Notify::flags.flying ? 1 : 0;
     default:
         return 0;
     }
@@ -467,59 +503,81 @@ uint8_t AP_RCProtocol_EXBUS::build_telem_reply(uint8_t packet_id, uint8_t sensor
     out[3] = packet_id;
     out[4] = EXBUS_DATA_TELEM;
 
+    const bool value_phase = (sensor_step & k_value_phase) != 0;
+    uint8_t group_index;
+    if (!value_phase && sensor_step < k_desc_rounds) {
+        group_index = sensor_step;
+    } else {
+        group_index = uint8_t(sensor_step & ~k_value_phase);
+        if (group_index >= k_sensor_count || k_sensors[group_index].type == ExType::DES) {
+            group_index = first_value_sensor();
+        }
+    }
+
     uint8_t ex_buf[40];
     memset(ex_buf, 0, sizeof(ex_buf));
     ex_buf[0] = 0x9F;
     ex_buf[2] = uint8_t(EXBUS_TELEM_MFG_ID & 0xFF);
     ex_buf[3] = uint8_t((EXBUS_TELEM_MFG_ID >> 8) & 0xFF);
-    ex_buf[4] = uint8_t(EXBUS_TELEM_DEV_ID & 0xFF);
-    ex_buf[5] = uint8_t((EXBUS_TELEM_DEV_ID >> 8) & 0xFF);
+    ex_buf[4] = uint8_t(group_index & 0xF0); // LSN_LB = device group
+    ex_buf[5] = EXBUS_TELEM_LSN_HB;
     ex_buf[6] = 0x00;
 
     uint8_t ex_len; // CRC coverage from type_len inclusive
-    if (sensor_step < k_desc_rounds) {
+    if (!value_phase && sensor_step < k_desc_rounds) {
         const uint8_t sid = sensor_step;
         const ExSensor &s = k_sensors[sid];
         const uint8_t lab_len = strnlen(s.label, 15);
         const uint8_t unit_len = strnlen(s.unit, 7);
         ex_len = uint8_t(1 + 4 + 1 + 1 + 1 + lab_len + unit_len);
         ex_buf[1] = ex_len; // type=0 text
-        ex_buf[7] = sid;
+        ex_buf[7] = uint8_t(sid & 0x0F); // EX id within device
         ex_buf[8] = uint8_t((lab_len << 3) | (unit_len & 0x07));
         memcpy(&ex_buf[9], s.label, lab_len);
         memcpy(&ex_buf[9 + lab_len], s.unit, unit_len);
-        next_sensor_step = uint8_t(sensor_step + 1);
+        if (sensor_step + 1 >= k_desc_rounds) {
+            next_sensor_step = uint8_t(k_value_phase | first_value_sensor());
+        } else {
+            next_sensor_step = uint8_t(sensor_step + 1);
+        }
     } else {
-        // Pack as many int22 values as fit (skip DES id 0)
-        uint8_t sid = uint8_t(1 + ((sensor_step - k_desc_rounds) % (k_sensor_count - 1)));
+        // Pack int22 values within one device group only
+        uint8_t sid = group_index;
+        const uint8_t group = uint8_t(sid & 0xF0);
+        const uint8_t group_end = uint8_t(group + 0x10);
         uint8_t *p = &ex_buf[7];
         uint8_t used = 0;
-        const uint8_t start_sid = sid;
-        do {
+        uint8_t last_sid = sid;
+
+        while (sid < group_end && sid < k_sensor_count) {
             if (k_sensors[sid].type == ExType::DES) {
-                sid = uint8_t(sid + 1);
-                if (sid >= k_sensor_count) {
-                    sid = 1;
+                sid = next_value_sensor(sid);
+                if ((sid & 0xF0) != group) {
+                    break;
                 }
                 continue;
             }
             if (used + 4 > k_extel_data_payload_max) {
                 break;
             }
-            *p++ = uint8_t((sid << 4) | uint8_t(k_sensors[sid].type));
+            *p++ = uint8_t(((sid & 0x0F) << 4) | uint8_t(k_sensors[sid].type));
             pack_int22(p, sensor_value(sid), k_sensors[sid].decimals);
             p += 3;
             used = uint8_t(used + 4);
-            sid = uint8_t(sid + 1);
-            if (sid >= k_sensor_count) {
-                sid = 1;
+            last_sid = sid;
+            sid = next_value_sensor(sid);
+            if ((sid & 0xF0) != group) {
+                break;
             }
-        } while (sid != start_sid && used + 4 <= k_extel_data_payload_max);
+            if (sid == group_index) {
+                break; // wrapped within group
+            }
+        }
 
         // type_len = bytes from type_len through last data byte
         ex_len = uint8_t(1 + 4 + 1 + used); // type_len + serial4 + res + payload
         ex_buf[1] = uint8_t(0x40 | ex_len); // type=1 data
-        next_sensor_step = uint8_t(k_desc_rounds + (sid - 1));
+        next_sensor_step = uint8_t(k_value_phase | next_value_sensor(last_sid));
     }
 
     const uint8_t crc8 = ex_crc8(&ex_buf[1], ex_len);

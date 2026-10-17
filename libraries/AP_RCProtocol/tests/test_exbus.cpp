@@ -9,6 +9,7 @@
 #include <AP_RCProtocol/AP_RCProtocol_EXBUS.h>
 #include <AP_SerialManager/AP_SerialManager.h>
 #include <RC_Channel/RC_Channel.h>
+#include <string.h>
 
 const AP_HAL::HAL& hal = AP_HAL::get_HAL();
 
@@ -155,6 +156,8 @@ TEST(EXBUSDecode, test_exbus_telem_reply_device_name)
     EXPECT_EQ(out[3], 0x06);
     EXPECT_EQ(out[4], 0x3A);
     EXPECT_EQ(out[6], 0x9F); // EXTEL sync
+    EXPECT_EQ(out[10], 0x00); // LSN_LB device group 0
+    EXPECT_EQ(out[11], 0x41); // LSN_HB
     // EX Bus CRC over frame without CRC bytes must match trailer
     const uint16_t crc = crc16_ccitt_r(out, len - 2, 0, 0);
     const uint16_t rx = uint16_t(out[len - 2]) | (uint16_t(out[len - 1]) << 8);
@@ -164,18 +167,47 @@ TEST(EXBUSDecode, test_exbus_telem_reply_device_name)
 
 TEST(EXBUSDecode, test_exbus_telem_reply_packed_values)
 {
-    // After all descriptors (step >= 15), data frames pack multiple int22 values
+    // Value phase: bit7 set; start at sensor index 1 (Voltage)
     uint8_t out[64] {};
     uint8_t next = 0;
-    const uint8_t len = AP_RCProtocol_EXBUS::build_telem_reply(0x11, 15, out, sizeof(out), next);
+    const uint8_t len = AP_RCProtocol_EXBUS::build_telem_reply(0x11, 0x81, out, sizeof(out), next);
     EXPECT_GT(len, 16);
     EXPECT_EQ(out[0], 0x3B);
     EXPECT_EQ(out[6], 0x9F);
     EXPECT_EQ(out[7] & 0xC0, 0x40); // EXTEL type = data
+    EXPECT_EQ(out[10], 0x00); // LSN_LB device group 0
+    EXPECT_EQ(out[11], 0x41); // LSN_HB
     const uint16_t crc = crc16_ccitt_r(out, len - 2, 0, 0);
     const uint16_t rx = uint16_t(out[len - 2]) | (uint16_t(out[len - 1]) << 8);
     EXPECT_EQ(crc, rx);
-    EXPECT_GT(next, 15);
+    EXPECT_EQ(next & 0x80, 0x80);
+}
+
+TEST(EXBUSDecode, test_exbus_telem_reply_status_device)
+{
+    // Descriptor for second device (index 16) uses LSN_LB = 0x10
+    uint8_t out[64] {};
+    uint8_t next = 0;
+    const uint8_t len = AP_RCProtocol_EXBUS::build_telem_reply(0x22, 16, out, sizeof(out), next);
+    EXPECT_GT(len, 8);
+    EXPECT_EQ(out[6], 0x9F);
+    EXPECT_EQ(out[7] & 0xC0, 0x00); // text
+    EXPECT_EQ(out[10], 0x10); // LSN_LB device group 1
+    EXPECT_EQ(out[11], 0x41);
+    EXPECT_EQ(out[13], 0x00); // EX id 0 = device name
+    const uint16_t crc = crc16_ccitt_r(out, len - 2, 0, 0);
+    const uint16_t rx = uint16_t(out[len - 2]) | (uint16_t(out[len - 1]) << 8);
+    EXPECT_EQ(crc, rx);
+    EXPECT_EQ(next, 17);
+
+    // Armed value on device 1
+    memset(out, 0, sizeof(out));
+    next = 0;
+    const uint8_t vlen = AP_RCProtocol_EXBUS::build_telem_reply(0x23, 0x91, out, sizeof(out), next);
+    EXPECT_GT(vlen, 16);
+    EXPECT_EQ(out[7] & 0xC0, 0x40);
+    EXPECT_EQ(out[10], 0x10);
+    EXPECT_EQ(out[13] & 0xF0, 0x10); // EX id 1 = Armed
 }
 #endif
 
