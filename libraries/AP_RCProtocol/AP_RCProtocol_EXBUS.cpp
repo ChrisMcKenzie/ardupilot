@@ -88,27 +88,50 @@ void AP_RCProtocol_EXBUS::_process_byte(uint32_t timestamp_us, uint8_t b)
 {
     _bytes_in++;
 
-    // incomplete frame: resync on inter-byte gap (Betaflight uses 1ms)
-    if (byte_input.ofs > 0 && (timestamp_us - byte_input.last_byte_us >= 1000U)) {
+    /*
+      Do NOT use a 1 ms inter-byte gap (Betaflight ISR style) on the UART path.
+      check_added_uart() drains the ring buffer in scheduler batches and stamps
+      each byte with AP_HAL::micros() at read time. A channel frame is ~3.2 ms
+      @ 125 kbit, so a >1 ms pause between batches was aborting mid-frame:
+      hdr kept rising, but ok and crcfail stayed 0 (CRC never reached).
+      Use a whole-frame timeout from the first byte instead.
+     */
+    if (byte_input.ofs > 0 &&
+        (timestamp_us - byte_input.start_us >= EXBUS_FRAME_TIMEOUT_US)) {
         byte_input.ofs = 0;
+        _frame_timeout++;
     }
-    byte_input.last_byte_us = timestamp_us;
 
     if (byte_input.ofs == 0) {
         if (b != EXBUS_HEAD_CHANNEL && b != EXBUS_HEAD_REQUEST) {
             return;
         }
         _headers++;
+        byte_input.start_us = timestamp_us;
     } else if (byte_input.ofs == 1) {
         if (b != EXBUS_REQ_REPLY && b != EXBUS_REQ_NO_REPLY) {
             byte_input.ofs = 0;
+            _drop++;
+            // try this byte as a new header
+            if (b == EXBUS_HEAD_CHANNEL || b == EXBUS_HEAD_REQUEST) {
+                _headers++;
+                byte_input.start_us = timestamp_us;
+                byte_input.buf[byte_input.ofs++] = b;
+            }
             return;
         }
     } else if (byte_input.ofs == 2) {
         if (b < EXBUS_MIN_FRAME_LEN || b > EXBUS_MAX_FRAME_LEN) {
             byte_input.ofs = 0;
+            _drop++;
             return;
         }
+    }
+
+    if (byte_input.ofs >= EXBUS_MAX_FRAME_LEN) {
+        byte_input.ofs = 0;
+        _drop++;
+        return;
     }
 
     byte_input.buf[byte_input.ofs++] = b;
@@ -136,6 +159,8 @@ void AP_RCProtocol_EXBUS::_process_byte(uint32_t timestamp_us, uint8_t b)
             _frames_ok++;
             // EX Bus has no failsafe flag; Master stops sending on RF loss
             add_input(nchan, values, false);
+        } else {
+            _drop++;
         }
     }
 
@@ -144,11 +169,16 @@ void AP_RCProtocol_EXBUS::_process_byte(uint32_t timestamp_us, uint8_t b)
 
 void AP_RCProtocol_EXBUS::process_byte(uint8_t b, uint32_t baudrate)
 {
+    process_byte_ts(b, baudrate, AP_HAL::micros());
+}
+
+void AP_RCProtocol_EXBUS::process_byte_ts(uint8_t b, uint32_t baudrate, uint32_t timestamp_us)
+{
     if (baudrate != 125000 && baudrate != 250000) {
         return;
     }
     _last_baud = baudrate;
-    _process_byte(AP_HAL::micros(), b);
+    _process_byte(timestamp_us, b);
 }
 
 void AP_RCProtocol_EXBUS::update(void)
@@ -167,14 +197,14 @@ void AP_RCProtocol_EXBUS::update(void)
         return;
     }
     _last_debug_ms = now;
-    // NOTICE so QGC shows this by default (INFO is often filtered)
+    // Keep under classic STATUSTEXT 50-char limit; NOTICE so QGC shows it.
     GCS_SEND_TEXT(MAV_SEVERITY_NOTICE,
-                  "EXBUS dbg: bytes=%lu hdr=%lu ok=%lu crcfail=%lu baud=%lu",
+                  "EXBUS b=%lu h=%lu ok=%lu crc=%lu to=%lu",
                   (unsigned long)_bytes_in,
                   (unsigned long)_headers,
                   (unsigned long)_frames_ok,
                   (unsigned long)_crc_fail,
-                  (unsigned long)_last_baud);
+                  (unsigned long)_frame_timeout);
 #endif
 }
 

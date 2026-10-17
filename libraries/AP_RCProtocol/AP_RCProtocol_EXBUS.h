@@ -31,6 +31,10 @@
 #define EXBUS_HEADER_LEN    6U
 #define EXBUS_CRC_LEN       2U
 
+// Whole-frame collect timeout (not inter-byte). 64 B @ 125 kbit ≈ 5.1 ms;
+// allow scheduler batching across several RC ticks.
+#define EXBUS_FRAME_TIMEOUT_US 10000U
+
 #define EXBUS_HEAD_CHANNEL  0x3E
 #define EXBUS_HEAD_REQUEST  0x3D
 #define EXBUS_REQ_REPLY     0x01
@@ -50,6 +54,9 @@ public:
     static bool decode_channel_frame(const uint8_t *frame, uint8_t frame_len,
                                      uint16_t *values, uint8_t &nchan);
 
+    // feed one byte with an explicit timestamp (SITL/tests; UART path uses micros())
+    void process_byte_ts(uint8_t byte, uint32_t baudrate, uint32_t timestamp_us);
+
 private:
     void _process_byte(uint32_t timestamp_us, uint8_t byte);
 
@@ -58,7 +65,7 @@ private:
     struct {
         uint8_t buf[EXBUS_MAX_FRAME_LEN];
         uint8_t ofs;
-        uint32_t last_byte_us;
+        uint32_t start_us; // timestamp of first byte of current frame
     } byte_input;
 
     // debug counters (reported while disarmed)
@@ -66,6 +73,8 @@ private:
     uint32_t _headers;
     uint32_t _frames_ok;
     uint32_t _crc_fail;
+    uint32_t _drop;          // rejected at byte1/byte2/len
+    uint32_t _frame_timeout; // aborted mid-frame by EXBUS_FRAME_TIMEOUT_US
     uint32_t _last_debug_ms;
     uint32_t _last_baud;
 };
