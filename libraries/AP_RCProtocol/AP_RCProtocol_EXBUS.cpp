@@ -154,8 +154,12 @@ void AP_RCProtocol_EXBUS::process_byte(uint8_t b, uint32_t baudrate)
 void AP_RCProtocol_EXBUS::update(void)
 {
 #if HAL_GCS_ENABLED
-    // While searching / before lock, emit counters so wiring issues are visible.
+    // Always emit while disarmed if EXBUS is enabled and an RCIN UART exists,
+    // including bytes=0 (diagnoses wrong port / no wire).
     if (hal.util->get_soft_armed()) {
+        return;
+    }
+    if (!protocol_enabled(AP_RCProtocol::EXBUS) || !have_UART()) {
         return;
     }
     const uint32_t now = AP_HAL::millis();
@@ -163,10 +167,6 @@ void AP_RCProtocol_EXBUS::update(void)
         return;
     }
     _last_debug_ms = now;
-    if (_bytes_in == 0 && _headers == 0) {
-        // stay quiet until something arrives at EXBUS baud
-        return;
-    }
     GCS_SEND_TEXT(MAV_SEVERITY_INFO,
                   "EXBUS dbg: bytes=%lu hdr=%lu ok=%lu crcfail=%lu baud=%lu",
                   (unsigned long)_bytes_in,

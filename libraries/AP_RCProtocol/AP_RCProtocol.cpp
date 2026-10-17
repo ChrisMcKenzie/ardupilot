@@ -425,14 +425,18 @@ void AP_RCProtocol::check_added_uart(void)
         added.last_config_change_ms = AP_HAL::millis();
         serial_configs[added.config_num].apply_to_uart(added.uart);
 #if AP_RCPROTOCOL_EXBUS_ENABLED
-        if (exbus_only && !hal.util->get_soft_armed()) {
-            static uint32_t last_cfg_msg_ms;
-            if (now - last_cfg_msg_ms > 2000) {
-                last_cfg_msg_ms = now;
-                const auto &cfg = serial_configs[added.config_num];
-                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "EXBUS probe: baud=%lu hdplex=%u",
-                              (unsigned long)cfg.baud,
-                              unsigned(cfg.half_duplex));
+        // Announce probe whenever EXBUS is enabled (not only EXBUS-only mask)
+        // and the active UART config is an EX Bus baud.
+        if (protocol_enabled(EXBUS) && !hal.util->get_soft_armed()) {
+            const auto &cfg = serial_configs[added.config_num];
+            if (cfg.baud == 125000U || cfg.baud == 250000U) {
+                static uint32_t last_cfg_msg_ms;
+                if (now - last_cfg_msg_ms > 2000) {
+                    last_cfg_msg_ms = now;
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "EXBUS probe: baud=%lu hdplex=%u",
+                                  (unsigned long)cfg.baud,
+                                  unsigned(cfg.half_duplex));
+                }
             }
         }
 #endif
