@@ -161,6 +161,22 @@ TEST(EXBUSDecode, test_exbus_telem_reply_device_name)
     EXPECT_EQ(crc, rx);
     EXPECT_EQ(next, 1);
 }
+
+TEST(EXBUSDecode, test_exbus_telem_reply_packed_values)
+{
+    // After all descriptors (step >= 15), data frames pack multiple int22 values
+    uint8_t out[64] {};
+    uint8_t next = 0;
+    const uint8_t len = AP_RCProtocol_EXBUS::build_telem_reply(0x11, 15, out, sizeof(out), next);
+    EXPECT_GT(len, 16);
+    EXPECT_EQ(out[0], 0x3B);
+    EXPECT_EQ(out[6], 0x9F);
+    EXPECT_EQ(out[7] & 0xC0, 0x40); // EXTEL type = data
+    const uint16_t crc = crc16_ccitt_r(out, len - 2, 0, 0);
+    const uint16_t rx = uint16_t(out[len - 2]) | (uint16_t(out[len - 1]) << 8);
+    EXPECT_EQ(crc, rx);
+    EXPECT_GT(next, 15);
+}
 #endif
 
 #endif  // AP_RCPROTOCOL_EXBUS_ENABLED

@@ -28,6 +28,14 @@
 #if AP_EXBUS_TELEM_ENABLED
 #include <AP_AHRS/AP_AHRS.h>
 #include <AP_BattMonitor/AP_BattMonitor.h>
+#include <AP_GPS/AP_GPS_config.h>
+#if AP_GPS_ENABLED
+#include <AP_GPS/AP_GPS.h>
+#endif
+#include <AP_Airspeed/AP_Airspeed_config.h>
+#if AP_AIRSPEED_ENABLED
+#include <AP_Airspeed/AP_Airspeed.h>
+#endif
 #endif
 #if AP_RCPROTOCOL_EXBUS_DEBUG
 #include <GCS_MAVLink/GCS.h>
@@ -248,49 +256,182 @@ struct ExSensor {
     const char *label;
     const char *unit;
     ExType type;
-    uint8_t decimals; // DECIMAL_MASK style: decimals in bits 5..6 of last value byte
+    uint8_t decimals; // bits 5..6 of last value byte (JETI EX)
 };
 
-// MVP sensor table (id 0 = device name). Keep small for flash + 4 ms window.
+/*
+  One EX device, ids 0..14 (JETI allows 15 value ids per device).
+  Id 0 = device name. Values cycle 1..N-1; several int22s packed per data frame.
+ */
 const ExSensor k_sensors[] = {
-    { "ArduPilot", "",   ExType::DES,   0 },
-    { "Voltage",   "V",  ExType::INT22, 1 },
-    { "Current",   "A",  ExType::INT22, 2 },
-    { "Altitude",  "m",  ExType::INT22, 1 },
-    { "Roll",      "\xB0", ExType::INT22, 1 },
-    { "Pitch",     "\xB0", ExType::INT22, 1 },
+    { "ArduPilot",  "",    ExType::DES,   0 }, // 0 device
+    { "Voltage",    "V",   ExType::INT22, 1 }, // 1
+    { "Current",    "A",   ExType::INT22, 2 }, // 2
+    { "Capacity",   "mAh", ExType::INT22, 0 }, // 3
+    { "Power",      "W",   ExType::INT22, 1 }, // 4
+    { "Altitude",   "m",   ExType::INT22, 1 }, // 5
+    { "Vario",      "m/s", ExType::INT22, 2 }, // 6
+    { "Roll",       "\xB0", ExType::INT22, 1 }, // 7
+    { "Pitch",      "\xB0", ExType::INT22, 1 }, // 8
+    { "Heading",    "\xB0", ExType::INT22, 1 }, // 9
+    { "Airspeed",   "m/s", ExType::INT22, 1 }, // 10
+    { "GPS Sats",   "",    ExType::INT22, 0 }, // 11
+    { "GPS Speed",  "m/s", ExType::INT22, 1 }, // 12
+    { "Home Dist",  "m",   ExType::INT22, 0 }, // 13
+    { "Remaining",  "%",   ExType::INT22, 0 }, // 14
 };
 
 constexpr uint8_t k_sensor_count = ARRAY_SIZE(k_sensors);
-constexpr uint8_t k_desc_rounds = k_sensor_count; // one text frame per sensor/device
+constexpr uint8_t k_desc_rounds = k_sensor_count;
+// EXTEL data payload budget after sync+type_len+serial+res (Betaflight ~18 B)
+constexpr uint8_t k_extel_data_payload_max = 18;
 
 uint8_t decimal_mask(uint8_t decimals)
 {
     return uint8_t(decimals << 5);
 }
 
+// Pack signed int22 + decimal nibble into 3 LE bytes (JETI / Betaflight layout)
+void pack_int22(uint8_t *p, int32_t val, uint8_t decimals)
+{
+    p[0] = uint8_t(val & 0xFF);
+    p[1] = uint8_t((val >> 8) & 0xFF);
+    p[2] = uint8_t(((val >> 16) & 0x1F) | decimal_mask(decimals));
+    if (val < 0) {
+        p[2] |= 0x80;
+    }
+}
+
 int32_t sensor_value(uint8_t id)
 {
+    // Singletons may be absent in unit tests — never crash the telem path
+    AP_AHRS *ahrs = AP_AHRS::get_singleton();
+    AP_BattMonitor *battery = AP_BattMonitor::get_singleton();
+
     switch (id) {
-    case 1: { // Voltage * 10
-        return int32_t(roundf(AP::battery().voltage() * 10.0f));
-    }
+    case 1: // Voltage * 10
+        if (battery == nullptr) {
+            return 0;
+        }
+        return int32_t(roundf(battery->voltage() * 10.0f));
     case 2: { // Current * 100
+        if (battery == nullptr) {
+            return 0;
+        }
         float amps = 0;
-        if (!AP::battery().current_amps(amps)) {
+        if (!battery->current_amps(amps)) {
             return 0;
         }
         return int32_t(roundf(amps * 100.0f));
     }
-    case 3: { // Altitude m * 10
+    case 3: { // Capacity mAh
+        if (battery == nullptr) {
+            return 0;
+        }
+        float mah = 0;
+        if (!battery->consumed_mah(mah)) {
+            return 0;
+        }
+        return int32_t(roundf(mah));
+    }
+    case 4: { // Power W * 10
+        if (battery == nullptr) {
+            return 0;
+        }
+        float amps = 0;
+        if (!battery->current_amps(amps)) {
+            return 0;
+        }
+        return int32_t(roundf(battery->voltage() * amps * 10.0f));
+    }
+    case 5: { // Altitude m * 10
+        if (ahrs == nullptr) {
+            return 0;
+        }
         float alt = 0;
-        AP::ahrs().get_relative_position_D_home(alt);
+        ahrs->get_relative_position_D_home(alt);
         return int32_t(roundf((-alt) * 10.0f));
     }
-    case 4: // Roll deg * 10
-        return int32_t(roundf(degrees(AP::ahrs().get_roll()) * 10.0f));
-    case 5: // Pitch deg * 10
-        return int32_t(roundf(degrees(AP::ahrs().get_pitch()) * 10.0f));
+    case 6: { // Vario m/s * 100
+        if (ahrs == nullptr) {
+            return 0;
+        }
+        Vector3f vel;
+        if (!ahrs->get_velocity_NED(vel)) {
+            return 0;
+        }
+        return int32_t(roundf((-vel.z) * 100.0f));
+    }
+    case 7: // Roll deg * 10
+        if (ahrs == nullptr) {
+            return 0;
+        }
+        return int32_t(roundf(degrees(ahrs->get_roll()) * 10.0f));
+    case 8: // Pitch deg * 10
+        if (ahrs == nullptr) {
+            return 0;
+        }
+        return int32_t(roundf(degrees(ahrs->get_pitch()) * 10.0f));
+    case 9: { // Heading deg * 10 (0..3600)
+        if (ahrs == nullptr) {
+            return 0;
+        }
+        float yaw_deg = degrees(ahrs->get_yaw());
+        if (yaw_deg < 0) {
+            yaw_deg += 360.0f;
+        }
+        return int32_t(roundf(yaw_deg * 10.0f));
+    }
+    case 10: { // Airspeed m/s * 10 (fallback groundspeed)
+        float spd = 0;
+#if AP_AIRSPEED_ENABLED
+        const AP_Airspeed *as = AP_Airspeed::get_singleton();
+        if (as != nullptr && as->healthy()) {
+            spd = as->get_airspeed();
+        } else
+#endif
+        if (ahrs != nullptr) {
+            spd = ahrs->groundspeed();
+        }
+        return int32_t(roundf(spd * 10.0f));
+    }
+    case 11: // GPS satellites
+#if AP_GPS_ENABLED
+        if (AP_GPS::get_singleton() != nullptr) {
+            return int32_t(AP::gps().num_sats());
+        }
+#endif
+        return 0;
+    case 12: // GPS speed m/s * 10
+#if AP_GPS_ENABLED
+        if (AP_GPS::get_singleton() != nullptr) {
+            return int32_t(roundf(AP::gps().ground_speed() * 10.0f));
+        }
+#endif
+        if (ahrs != nullptr) {
+            return int32_t(roundf(ahrs->groundspeed() * 10.0f));
+        }
+        return 0;
+    case 13: { // Home distance m
+        if (ahrs == nullptr) {
+            return 0;
+        }
+        Vector2f ne;
+        if (!ahrs->get_relative_position_NE_home(ne)) {
+            return 0;
+        }
+        return int32_t(roundf(ne.length()));
+    }
+    case 14: { // Remaining %
+        if (battery == nullptr) {
+            return 0;
+        }
+        uint8_t pct = 0;
+        if (!battery->capacity_remaining_pct(pct)) {
+            return 0;
+        }
+        return int32_t(pct);
+    }
     default:
         return 0;
     }
@@ -307,7 +448,7 @@ void AP_RCProtocol_EXBUS::handle_telem_request(const uint8_t *frame, uint8_t fra
         return;
     }
     if (frame[4] != EXBUS_DATA_TELEM) {
-        return; // Jetibox 0x3B etc. ignored in MVP
+        return; // Jetibox 0x3B etc. not yet
     }
     telem.pending = true;
     telem.packet_id = frame[3];
@@ -321,7 +462,6 @@ uint8_t AP_RCProtocol_EXBUS::build_telem_reply(uint8_t packet_id, uint8_t sensor
         return 0;
     }
 
-    // EX Bus header placeholders; LEN/SUB_LEN filled after EXTEL size known
     out[0] = EXBUS_HEAD_REPLY;
     out[1] = EXBUS_REQ_REPLY;
     out[3] = packet_id;
@@ -329,43 +469,62 @@ uint8_t AP_RCProtocol_EXBUS::build_telem_reply(uint8_t packet_id, uint8_t sensor
 
     uint8_t ex_buf[40];
     memset(ex_buf, 0, sizeof(ex_buf));
-    ex_buf[0] = 0x9F; // EXTEL sync (N=9)
+    ex_buf[0] = 0x9F;
     ex_buf[2] = uint8_t(EXBUS_TELEM_MFG_ID & 0xFF);
     ex_buf[3] = uint8_t((EXBUS_TELEM_MFG_ID >> 8) & 0xFF);
     ex_buf[4] = uint8_t(EXBUS_TELEM_DEV_ID & 0xFF);
     ex_buf[5] = uint8_t((EXBUS_TELEM_DEV_ID >> 8) & 0xFF);
-    ex_buf[6] = 0x00; // reserved
+    ex_buf[6] = 0x00;
 
-    // sensor_step 0..k_desc_rounds-1 = text descriptors; then values for ids 1..N-1
-    uint8_t ex_len; // CRC coverage length starting at type_len (ex_buf[1])
+    uint8_t ex_len; // CRC coverage from type_len inclusive
     if (sensor_step < k_desc_rounds) {
         const uint8_t sid = sensor_step;
         const ExSensor &s = k_sensors[sid];
         const uint8_t lab_len = strnlen(s.label, 15);
         const uint8_t unit_len = strnlen(s.unit, 7);
         ex_len = uint8_t(1 + 4 + 1 + 1 + 1 + lab_len + unit_len);
-        ex_buf[1] = ex_len; // type=0 (text)
+        ex_buf[1] = ex_len; // type=0 text
         ex_buf[7] = sid;
         ex_buf[8] = uint8_t((lab_len << 3) | (unit_len & 0x07));
         memcpy(&ex_buf[9], s.label, lab_len);
         memcpy(&ex_buf[9 + lab_len], s.unit, unit_len);
         next_sensor_step = uint8_t(sensor_step + 1);
     } else {
+        // Pack as many int22 values as fit (skip DES id 0)
         uint8_t sid = uint8_t(1 + ((sensor_step - k_desc_rounds) % (k_sensor_count - 1)));
-        const ExSensor &s = k_sensors[sid];
-        const int32_t val = sensor_value(sid);
-        ex_len = 1 + 4 + 1 + 1 + 3;
-        ex_buf[1] = uint8_t(0x40 | ex_len); // type=1 (data)
-        ex_buf[7] = uint8_t((sid << 4) | uint8_t(s.type));
-        ex_buf[8] = uint8_t(val & 0xFF);
-        ex_buf[9] = uint8_t((val >> 8) & 0xFF);
-        ex_buf[10] = uint8_t(((val >> 16) & 0x1F) | decimal_mask(s.decimals));
-        next_sensor_step = uint8_t(sensor_step + 1);
+        uint8_t *p = &ex_buf[7];
+        uint8_t used = 0;
+        const uint8_t start_sid = sid;
+        do {
+            if (k_sensors[sid].type == ExType::DES) {
+                sid = uint8_t(sid + 1);
+                if (sid >= k_sensor_count) {
+                    sid = 1;
+                }
+                continue;
+            }
+            if (used + 4 > k_extel_data_payload_max) {
+                break;
+            }
+            *p++ = uint8_t((sid << 4) | uint8_t(k_sensors[sid].type));
+            pack_int22(p, sensor_value(sid), k_sensors[sid].decimals);
+            p += 3;
+            used = uint8_t(used + 4);
+            sid = uint8_t(sid + 1);
+            if (sid >= k_sensor_count) {
+                sid = 1;
+            }
+        } while (sid != start_sid && used + 4 <= k_extel_data_payload_max);
+
+        // type_len = bytes from type_len through last data byte
+        ex_len = uint8_t(1 + 4 + 1 + used); // type_len + serial4 + res + payload
+        ex_buf[1] = uint8_t(0x40 | ex_len); // type=1 data
+        next_sensor_step = uint8_t(k_desc_rounds + (sid - 1));
     }
 
     const uint8_t crc8 = ex_crc8(&ex_buf[1], ex_len);
     ex_buf[1 + ex_len] = crc8;
-    const uint8_t ex_total = uint8_t(1 + ex_len + 1); // sync + body + crc8
+    const uint8_t ex_total = uint8_t(1 + ex_len + 1);
 
     const uint8_t sub_len = ex_total;
     const uint8_t frame_len = uint8_t(EXBUS_OVERHEAD + sub_len);
