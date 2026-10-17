@@ -315,7 +315,6 @@ private:
         uint32_t last_config_change_ms;
         uint8_t config_num;
         uint8_t serial_idx; // SERIALn index from SerialManager (255 if unknown)
-        bool rcin_announced; // one-shot EXBUS RCIN NOTICE
 #if AP_RCPROTOCOL_CRSF_ENABLED && (defined(STM32F4) || defined(STM32F7))
         uint32_t crsf_dma_warning_ms;
 #endif

@@ -48,7 +48,9 @@ public:
 
     void process_pulse(uint32_t width_s0, uint32_t width_s1) override;
     void process_byte(uint8_t byte, uint32_t baudrate) override;
+#if AP_RCPROTOCOL_EXBUS_DEBUG
     void update(void) override;
+#endif
 
     // decode a complete channel frame; returns true on valid CRC and channel block
     static bool decode_channel_frame(const uint8_t *frame, uint8_t frame_len,
@@ -68,15 +70,16 @@ private:
         uint32_t start_us; // timestamp of first byte of current frame
     } byte_input;
 
-    // debug counters (reported while disarmed)
+#if AP_RCPROTOCOL_EXBUS_DEBUG
     uint32_t _bytes_in;
     uint32_t _headers;
     uint32_t _frames_ok;
     uint32_t _crc_fail;
-    uint32_t _drop;          // rejected at byte1/byte2/len
-    uint32_t _frame_timeout; // aborted mid-frame by EXBUS_FRAME_TIMEOUT_US
+    uint32_t _drop;
+    uint32_t _frame_timeout;
     uint32_t _last_debug_ms;
     uint32_t _last_baud;
+#endif
 };
 
 #endif  // AP_RCPROTOCOL_EXBUS_ENABLED

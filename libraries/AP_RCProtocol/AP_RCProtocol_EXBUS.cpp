@@ -22,7 +22,9 @@
 
 #include "AP_RCProtocol_EXBUS.h"
 #include <AP_Math/crc.h>
+#if AP_RCPROTOCOL_EXBUS_DEBUG
 #include <GCS_MAVLink/GCS.h>
+#endif
 
 extern const AP_HAL::HAL& hal;
 
@@ -86,35 +88,44 @@ void AP_RCProtocol_EXBUS::process_pulse(uint32_t width_s0, uint32_t width_s1)
 
 void AP_RCProtocol_EXBUS::_process_byte(uint32_t timestamp_us, uint8_t b)
 {
+#if AP_RCPROTOCOL_EXBUS_DEBUG
     _bytes_in++;
+#endif
 
     /*
       Do NOT use a 1 ms inter-byte gap (Betaflight ISR style) on the UART path.
       check_added_uart() drains the ring buffer in scheduler batches and stamps
       each byte with AP_HAL::micros() at read time. A channel frame is ~3.2 ms
-      @ 125 kbit, so a >1 ms pause between batches was aborting mid-frame:
-      hdr kept rising, but ok and crcfail stayed 0 (CRC never reached).
+      @ 125 kbit, so a >1 ms pause between batches was aborting mid-frame.
       Use a whole-frame timeout from the first byte instead.
      */
     if (byte_input.ofs > 0 &&
         (timestamp_us - byte_input.start_us >= EXBUS_FRAME_TIMEOUT_US)) {
         byte_input.ofs = 0;
+#if AP_RCPROTOCOL_EXBUS_DEBUG
         _frame_timeout++;
+#endif
     }
 
     if (byte_input.ofs == 0) {
         if (b != EXBUS_HEAD_CHANNEL && b != EXBUS_HEAD_REQUEST) {
             return;
         }
+#if AP_RCPROTOCOL_EXBUS_DEBUG
         _headers++;
+#endif
         byte_input.start_us = timestamp_us;
     } else if (byte_input.ofs == 1) {
         if (b != EXBUS_REQ_REPLY && b != EXBUS_REQ_NO_REPLY) {
             byte_input.ofs = 0;
+#if AP_RCPROTOCOL_EXBUS_DEBUG
             _drop++;
+#endif
             // try this byte as a new header
             if (b == EXBUS_HEAD_CHANNEL || b == EXBUS_HEAD_REQUEST) {
+#if AP_RCPROTOCOL_EXBUS_DEBUG
                 _headers++;
+#endif
                 byte_input.start_us = timestamp_us;
                 byte_input.buf[byte_input.ofs++] = b;
             }
@@ -123,14 +134,18 @@ void AP_RCProtocol_EXBUS::_process_byte(uint32_t timestamp_us, uint8_t b)
     } else if (byte_input.ofs == 2) {
         if (b < EXBUS_MIN_FRAME_LEN || b > EXBUS_MAX_FRAME_LEN) {
             byte_input.ofs = 0;
+#if AP_RCPROTOCOL_EXBUS_DEBUG
             _drop++;
+#endif
             return;
         }
     }
 
     if (byte_input.ofs >= EXBUS_MAX_FRAME_LEN) {
         byte_input.ofs = 0;
+#if AP_RCPROTOCOL_EXBUS_DEBUG
         _drop++;
+#endif
         return;
     }
 
@@ -154,13 +169,19 @@ void AP_RCProtocol_EXBUS::_process_byte(uint32_t timestamp_us, uint8_t b)
         const uint16_t crc_calc = crc16_ccitt_r(byte_input.buf, frame_len - EXBUS_CRC_LEN, 0, 0);
         const uint16_t crc_rx = uint16_t(byte_input.buf[frame_len - 2]) | (uint16_t(byte_input.buf[frame_len - 1]) << 8);
         if (crc_calc != crc_rx) {
+#if AP_RCPROTOCOL_EXBUS_DEBUG
             _crc_fail++;
+#endif
         } else if (decode_channel_frame(byte_input.buf, frame_len, values, nchan)) {
+#if AP_RCPROTOCOL_EXBUS_DEBUG
             _frames_ok++;
+#endif
             // EX Bus has no failsafe flag; Master stops sending on RF loss
             add_input(nchan, values, false);
+#if AP_RCPROTOCOL_EXBUS_DEBUG
         } else {
             _drop++;
+#endif
         }
     }
 
@@ -177,15 +198,16 @@ void AP_RCProtocol_EXBUS::process_byte_ts(uint8_t b, uint32_t baudrate, uint32_t
     if (baudrate != 125000 && baudrate != 250000) {
         return;
     }
+#if AP_RCPROTOCOL_EXBUS_DEBUG
     _last_baud = baudrate;
+#endif
     _process_byte(timestamp_us, b);
 }
 
+#if AP_RCPROTOCOL_EXBUS_DEBUG
 void AP_RCProtocol_EXBUS::update(void)
 {
 #if HAL_GCS_ENABLED
-    // Always emit while disarmed if EXBUS is enabled and an RCIN UART exists,
-    // including bytes=0 (diagnoses wrong port / no wire).
     if (hal.util->get_soft_armed()) {
         return;
     }
@@ -197,8 +219,7 @@ void AP_RCProtocol_EXBUS::update(void)
         return;
     }
     _last_debug_ms = now;
-    // Keep under classic STATUSTEXT 50-char limit; NOTICE so QGC shows it.
-    GCS_SEND_TEXT(MAV_SEVERITY_NOTICE,
+    GCS_SEND_TEXT(MAV_SEVERITY_DEBUG,
                   "EXBUS b=%lu h=%lu ok=%lu crc=%lu to=%lu",
                   (unsigned long)_bytes_in,
                   (unsigned long)_headers,
@@ -207,5 +228,6 @@ void AP_RCProtocol_EXBUS::update(void)
                   (unsigned long)_frame_timeout);
 #endif
 }
+#endif  // AP_RCPROTOCOL_EXBUS_DEBUG
 
 #endif  // AP_RCPROTOCOL_EXBUS_ENABLED

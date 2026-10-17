@@ -424,28 +424,18 @@ void AP_RCProtocol::check_added_uart(void)
         added.opened = true;
         added.last_config_change_ms = AP_HAL::millis();
         serial_configs[added.config_num].apply_to_uart(added.uart);
-#if AP_RCPROTOCOL_EXBUS_ENABLED
-        // One-shot: confirm which SERIALn RCIN UART is bound (QGC-visible NOTICE)
-        if (!added.rcin_announced && protocol_enabled(EXBUS)) {
-            added.rcin_announced = true;
-            if (added.serial_idx != 255) {
-                GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "EXBUS: RCIN on SERIAL%u",
-                              unsigned(added.serial_idx));
-            } else {
-                GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "EXBUS: RCIN UART registered");
-            }
-        }
-        // Announce probe whenever EXBUS is enabled (not only EXBUS-only mask)
-        // and the active UART config is an EX Bus baud.
+#if AP_RCPROTOCOL_EXBUS_ENABLED && AP_RCPROTOCOL_EXBUS_DEBUG
+        // Optional bring-up spam (compile with AP_RCPROTOCOL_EXBUS_DEBUG=1)
         if (protocol_enabled(EXBUS) && !hal.util->get_soft_armed()) {
             const auto &cfg = serial_configs[added.config_num];
             if (cfg.baud == 125000U || cfg.baud == 250000U) {
                 static uint32_t last_cfg_msg_ms;
                 if (now - last_cfg_msg_ms > 2000) {
                     last_cfg_msg_ms = now;
-                    GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "EXBUS probe: baud=%lu hdplex=%u",
+                    GCS_SEND_TEXT(MAV_SEVERITY_DEBUG, "EXBUS probe: baud=%lu hdplex=%u SERIAL%u",
                                   (unsigned long)cfg.baud,
-                                  unsigned(cfg.half_duplex));
+                                  unsigned(cfg.half_duplex),
+                                  unsigned(added.serial_idx));
                 }
             }
         }
@@ -586,13 +576,6 @@ void AP_RCProtocol::announce_detected()
     }
     (void)src;  // iofirmware doesn't use this
     (void)name;  // iofirmware doesn't use this
-#if AP_RCPROTOCOL_EXBUS_ENABLED
-    // NOTICE so QGC shows EXBUS lock by default (DEBUG/INFO often hidden)
-    if (_detected_protocol == EXBUS) {
-        GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "RCInput: decoding %s (%s)", name, src);
-        return;
-    }
-#endif
     GCS_SEND_TEXT(MAV_SEVERITY_DEBUG, "RCInput: decoding %s (%s)", name, src);
 }
 
