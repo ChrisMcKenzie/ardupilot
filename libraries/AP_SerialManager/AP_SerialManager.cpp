@@ -537,7 +537,9 @@ void AP_SerialManager::init()
                     if (!AP::RC().has_uart()) {
                         AP::RC().add_uart(uart, i);
                     } else {
-                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SERIAL%u_PROTOCOL: duplicate RCIN not permitted", i);
+                        // First SERIALn with PROTOCOL=23 wins; later ones are ignored.
+                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                      "SERIAL%u_PROTOCOL=23 ignored (RCIN already set); set to 0", i);
                     }
 
                     break;
