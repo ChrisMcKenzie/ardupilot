@@ -83,8 +83,8 @@ void AP_RCProtocol_EXBUS::process_pulse(uint32_t width_s0, uint32_t width_s1)
 
 void AP_RCProtocol_EXBUS::_process_byte(uint32_t timestamp_us, uint8_t b)
 {
-    // incomplete frame: resync on inter-byte gap (full LS frame is ~3ms)
-    if (byte_input.ofs > 0 && (timestamp_us - byte_input.last_byte_us >= 2000U)) {
+    // incomplete frame: resync on inter-byte gap (Betaflight uses 1ms)
+    if (byte_input.ofs > 0 && (timestamp_us - byte_input.last_byte_us >= 1000U)) {
         byte_input.ofs = 0;
     }
     byte_input.last_byte_us = timestamp_us;

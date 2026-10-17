@@ -331,35 +331,47 @@ void AP_RCProtocol::SerialConfig::apply_to_uart(AP_HAL::UARTDriver *uart) const
 {
     uart->configure_parity(parity);
     uart->set_stop_bits(stop_bits);
+    uint16_t options = uart->get_options();
     if (invert_rx) {
-        uart->set_options(uart->get_options() | AP_HAL::UARTDriver::OPTION_RXINV);
+        options |= AP_HAL::UARTDriver::OPTION_RXINV;
     } else {
-        uart->set_options(uart->get_options() & ~AP_HAL::UARTDriver::OPTION_RXINV);
+        options &= ~AP_HAL::UARTDriver::OPTION_RXINV;
     }
+    // EX Bus is a single-wire bus; Betaflight-style wiring uses the UART TX pin
+    // in half-duplex. Full-duplex configs keep the RX pin for RX-only wiring.
+    if (half_duplex) {
+        options |= AP_HAL::UARTDriver::OPTION_HDPLEX;
+    } else {
+        options &= ~AP_HAL::UARTDriver::OPTION_HDPLEX;
+    }
+    uart->set_options(options);
     uart->begin(baud, 128, 128);
 }
 
 static const AP_RCProtocol::SerialConfig serial_configs[] {
-    // BAUD PRTY STOP INVERT-RX
+    // BAUD PRTY STOP INVERT-RX HALF-DUPLEX
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+    // JETI EX Bus first so auto-detect finds 125k quickly (R3 default is LowSpeed).
+    // Try TX half-duplex (common single-wire hookup) and RX full-duplex.
+    { 125000,  0,   1, false, true  },
+    { 125000,  0,   1, false, false },
+    { 250000,  0,   1, false, true  },
+    { 250000,  0,   1, false, false },
+#endif
     // inverted and uninverted 115200 8N1:
-    { 115200,  0,   1, false  },
-    { 115200,  0,   1, true },
+    { 115200,  0,   1, false, false },
+    { 115200,  0,   1, true,  false },
     // SBUS settings, even parity, 2 stop bits:
-    { 100000,  2,   2, true },
+    { 100000,  2,   2, true,  false },
 #if AP_RCPROTOCOL_FASTSBUS_ENABLED
     // FastSBUS:
-    { 200000,  2,   2, true },
+    { 200000,  2,   2, true,  false },
 #endif
 #if AP_RCPROTOCOL_CRSF_ENABLED || AP_RCPROTOCOL_GHST_ENABLED
     // CrossFire:
-    { 416666,  0,   1, false },
+    { 416666,  0,   1, false, false },
     // CRSFv3 can negotiate higher rates which are sticky on soft reboot
-    { 2000000, 0,   1, false },
-#endif
-#if AP_RCPROTOCOL_EXBUS_ENABLED
-    // JETI EX Bus LowSpeed / HighSpeed:
-    { 125000,  0,   1, false },
-    { 250000,  0,   1, false },
+    { 2000000, 0,   1, false, false },
 #endif
 };
 

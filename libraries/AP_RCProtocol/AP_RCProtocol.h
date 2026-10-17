@@ -263,6 +263,7 @@ public:
         uint8_t parity;
         uint8_t stop_bits;
         bool invert_rx;
+        bool half_duplex; // one-wire on TX pin (JETI EX Bus / similar)
     };
 
     // return true if we are decoding a byte stream, instead of pulses
