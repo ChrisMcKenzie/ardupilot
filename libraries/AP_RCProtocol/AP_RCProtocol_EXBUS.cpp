@@ -22,6 +22,9 @@
 
 #include "AP_RCProtocol_EXBUS.h"
 #include <AP_Math/crc.h>
+#include <GCS_MAVLink/GCS.h>
+
+extern const AP_HAL::HAL& hal;
 
 /*
   decode a full EX Bus channel frame.
@@ -83,6 +86,8 @@ void AP_RCProtocol_EXBUS::process_pulse(uint32_t width_s0, uint32_t width_s1)
 
 void AP_RCProtocol_EXBUS::_process_byte(uint32_t timestamp_us, uint8_t b)
 {
+    _bytes_in++;
+
     // incomplete frame: resync on inter-byte gap (Betaflight uses 1ms)
     if (byte_input.ofs > 0 && (timestamp_us - byte_input.last_byte_us >= 1000U)) {
         byte_input.ofs = 0;
@@ -93,6 +98,7 @@ void AP_RCProtocol_EXBUS::_process_byte(uint32_t timestamp_us, uint8_t b)
         if (b != EXBUS_HEAD_CHANNEL && b != EXBUS_HEAD_REQUEST) {
             return;
         }
+        _headers++;
     } else if (byte_input.ofs == 1) {
         if (b != EXBUS_REQ_REPLY && b != EXBUS_REQ_NO_REPLY) {
             byte_input.ofs = 0;
@@ -121,9 +127,16 @@ void AP_RCProtocol_EXBUS::_process_byte(uint32_t timestamp_us, uint8_t b)
 
     uint16_t values[MAX_RCIN_CHANNELS];
     uint8_t nchan = 0;
-    if (decode_channel_frame(byte_input.buf, frame_len, values, nchan)) {
-        // EX Bus has no failsafe flag; Master stops sending on RF loss
-        add_input(nchan, values, false);
+    if (byte_input.buf[0] == EXBUS_HEAD_CHANNEL) {
+        const uint16_t crc_calc = crc16_ccitt_r(byte_input.buf, frame_len - EXBUS_CRC_LEN, 0, 0);
+        const uint16_t crc_rx = uint16_t(byte_input.buf[frame_len - 2]) | (uint16_t(byte_input.buf[frame_len - 1]) << 8);
+        if (crc_calc != crc_rx) {
+            _crc_fail++;
+        } else if (decode_channel_frame(byte_input.buf, frame_len, values, nchan)) {
+            _frames_ok++;
+            // EX Bus has no failsafe flag; Master stops sending on RF loss
+            add_input(nchan, values, false);
+        }
     }
 
     byte_input.ofs = 0;
@@ -134,7 +147,34 @@ void AP_RCProtocol_EXBUS::process_byte(uint8_t b, uint32_t baudrate)
     if (baudrate != 125000 && baudrate != 250000) {
         return;
     }
+    _last_baud = baudrate;
     _process_byte(AP_HAL::micros(), b);
+}
+
+void AP_RCProtocol_EXBUS::update(void)
+{
+#if HAL_GCS_ENABLED
+    // While searching / before lock, emit counters so wiring issues are visible.
+    if (hal.util->get_soft_armed()) {
+        return;
+    }
+    const uint32_t now = AP_HAL::millis();
+    if (now - _last_debug_ms < 3000) {
+        return;
+    }
+    _last_debug_ms = now;
+    if (_bytes_in == 0 && _headers == 0) {
+        // stay quiet until something arrives at EXBUS baud
+        return;
+    }
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                  "EXBUS dbg: bytes=%lu hdr=%lu ok=%lu crcfail=%lu baud=%lu",
+                  (unsigned long)_bytes_in,
+                  (unsigned long)_headers,
+                  (unsigned long)_frames_ok,
+                  (unsigned long)_crc_fail,
+                  (unsigned long)_last_baud);
+#endif
 }
 
 #endif  // AP_RCPROTOCOL_EXBUS_ENABLED

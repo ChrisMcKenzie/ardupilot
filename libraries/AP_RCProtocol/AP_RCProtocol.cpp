@@ -388,14 +388,55 @@ void AP_RCProtocol::check_added_uart(void)
         // not using this uart
         return;
     }
+#if AP_RC_CHANNEL_ENABLED
+    rc_protocols_mask = rc().enabled_protocols();
+#endif
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+    // When RC_PROTOCOLS enables only EXBUS, skip unrelated UART baud configs
+    // so 125k/250k half-duplex is probed continuously.
+    bool exbus_only = false;
+    if (protocol_enabled(EXBUS) && (rc_protocols_mask & 1U) == 0) {
+        exbus_only = true;
+        for (uint8_t i = 0; i < uint8_t(NONE); i++) {
+            if (i == uint8_t(EXBUS)) {
+                continue;
+            }
+            if (backend[i] != nullptr && protocol_enabled(rcprotocol_t(i))) {
+                exbus_only = false;
+                break;
+            }
+        }
+    }
+    const uint32_t cfg_baud = serial_configs[added.config_num].baud;
+    const bool cfg_is_exbus = (cfg_baud == 125000U || cfg_baud == 250000U);
+    if (exbus_only && !cfg_is_exbus) {
+        for (uint8_t i = 0; i < ARRAY_SIZE(serial_configs); i++) {
+            const uint32_t b = serial_configs[i].baud;
+            if (b == 125000U || b == 250000U) {
+                added.config_num = i;
+                added.opened = false;
+                break;
+            }
+        }
+    }
+#endif  // AP_RCPROTOCOL_EXBUS_ENABLED
     if (!added.opened) {
         added.opened = true;
         added.last_config_change_ms = AP_HAL::millis();
         serial_configs[added.config_num].apply_to_uart(added.uart);
-    }
-#if AP_RC_CHANNEL_ENABLED
-    rc_protocols_mask = rc().enabled_protocols();
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+        if (exbus_only && !hal.util->get_soft_armed()) {
+            static uint32_t last_cfg_msg_ms;
+            if (now - last_cfg_msg_ms > 2000) {
+                last_cfg_msg_ms = now;
+                const auto &cfg = serial_configs[added.config_num];
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "EXBUS probe: baud=%lu hdplex=%u",
+                              (unsigned long)cfg.baud,
+                              unsigned(cfg.half_duplex));
+            }
+        }
 #endif
+    }
 #if AP_RCPROTOCOL_CRSF_ENABLED && (defined(STM32F4) || defined(STM32F7))
     // warn every 10s while disarmed if CRSF has been detected
     if (added.uart->is_initialized() &&
@@ -421,10 +462,23 @@ void AP_RCProtocol::check_added_uart(void)
     if (searching) {
         if (now - added.last_config_change_ms > 1000) {
             // change configs if not detected once a second
+#if AP_RCPROTOCOL_EXBUS_ENABLED
+            const uint8_t start = added.config_num;
+            do {
+                added.config_num++;
+                if (added.config_num >= ARRAY_SIZE(serial_configs)) {
+                    added.config_num = 0;
+                }
+            } while (exbus_only &&
+                     !(serial_configs[added.config_num].baud == 125000U ||
+                       serial_configs[added.config_num].baud == 250000U) &&
+                     added.config_num != start);
+#else
             added.config_num++;
             if (added.config_num >= ARRAY_SIZE(serial_configs)) {
                 added.config_num = 0;
             }
+#endif
             added.opened = false;
         }
     // power loss on CRSF requires re-bootstrap because the baudrate is reset to the default. The CRSF side will
